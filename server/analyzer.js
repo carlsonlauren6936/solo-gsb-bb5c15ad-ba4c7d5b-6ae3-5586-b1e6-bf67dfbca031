@@ -269,6 +269,259 @@ function schedulePath(zones, edges, startId, targetId, blockedZoneIds, reservati
   };
 }
 
+/* ============================================================
+ * 调度顺序优化
+ *
+ * 默认调度结果始终按演员表顺序给出（保持不变）；优化器仅作为“建议”旁路计算：
+ * 对每次转场中“需要移动（静态最短耗时 > 0）且静态可达”的演员（mover），
+ * 比较不同出场顺序在同一套预约调度规则下的表现，按指标向量
+ *     (超时人数, 最晚到达秒数, 总等待秒数)
+ * 的字典序取最小方案；指标完全相同则以原演员表顺序稳定决胜（不改动顺序）。
+ *
+ * mover 不超过 EXACT_LIMIT（8）人时，用分支限界枚举全排列（前缀指标单调，
+ * 可安全剪枝），结果为精确最优；超过 8 人时改用确定性贪心（逐位选择使前缀
+ * 指标字典序最小的演员），并明确标注为近似结果，避免阶乘爆炸。
+ * ============================================================ */
+
+const EXACT_LIMIT = 8;
+
+function cmpTuple(a, b) {
+  for (let k = 0; k < 3; k++) {
+    if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** 将某演员方案的窄通道占用登记进预约表；返回可用于 LIFO 回滚的句柄 */
+function reserveLegs(reservations, schedule, actor) {
+  const pushed = [];
+  for (const leg of schedule.legs) {
+    if (!leg.narrow) continue;
+    const iv = { edgeId: leg.edgeId, start: leg.enterAt, end: leg.leaveAt, actorId: actor.id, actorName: actor.name };
+    const arr = reservations.get(leg.edgeId) || [];
+    arr.push(iv);
+    arr.sort((x, y) => x.start - y.start);
+    reservations.set(leg.edgeId, arr);
+    pushed.push(iv);
+  }
+  return pushed;
+}
+
+/** 回滚本次登记（按对象身份剔除，保证 LIFO 安全） */
+function rollbackReservations(reservations, pushed) {
+  for (const iv of pushed) {
+    const arr = reservations.get(iv.edgeId);
+    if (!arr) continue;
+    const idx = arr.indexOf(iv);
+    if (idx >= 0) arr.splice(idx, 1);
+  }
+}
+
+/**
+ * 按给定顺序模拟一次转场预约调度，返回指标与逐人路线明细。
+ * movers 中的静态路径信息（seconds / staticPath）由调用方预先提供。
+ */
+function simulateOrder(zones, edges, blockedZoneIds, reservations, limit, movers, order, zoneNameFn) {
+  const details = [];
+  for (const idx of order) {
+    const m = movers[idx];
+    const schedule = schedulePath(zones, edges, m.startId, m.targetId, blockedZoneIds, reservations) || null;
+    if (schedule) reserveLegs(reservations, schedule, m.actor);
+    const arriveAt = schedule ? schedule.arriveAt : null;
+    const waitSeconds = schedule ? schedule.totalWaitSeconds : 0;
+    let pathZoneIds = [];
+    if (schedule && schedule.legs.length) {
+      pathZoneIds = [schedule.legs[0].fromZoneId, ...schedule.legs.map((l) => l.toZoneId)];
+    } else if (schedule) {
+      pathZoneIds = [m.startId]; // 原地（理论上 mover 已排除，兜底）
+    }
+    let status;
+    if (!schedule) status = 'unreachable';
+    else if (m.staticSeconds > limit) status = 'timeout';
+    else if (arriveAt > limit) status = 'congested';
+    else status = 'ok';
+    details.push({
+      actorId: m.actor.id,
+      actorName: m.actor.name,
+      fromZoneId: m.startId,
+      toZoneId: m.targetId,
+      fromZoneName: zoneNameFn(m.startId),
+      toZoneName: zoneNameFn(m.targetId),
+      status,
+      staticSeconds: m.staticSeconds,
+      arriveAt,
+      waitSeconds,
+      travelSeconds: schedule ? schedule.travelSeconds : null,
+      pathZoneIds,
+      pathZoneNames: pathZoneIds.map(zoneNameFn),
+      schedule: schedule
+        ? {
+            departAt: 0,
+            arriveAt: schedule.arriveAt,
+            totalWaitSeconds: schedule.totalWaitSeconds,
+            legs: schedule.legs.map((l) => ({
+              ...l,
+              fromZoneName: zoneNameFn(l.fromZoneId),
+              toZoneName: zoneNameFn(l.toZoneId),
+            })),
+            waits: schedule.waits.map((w) => ({ ...w, zoneName: zoneNameFn(w.zoneId) })),
+          }
+        : null,
+    });
+  }
+  const reached = details.filter((d) => d.arriveAt != null);
+  const metrics = {
+    lateCount: details.filter((d) => d.status === 'timeout' || d.status === 'congested').length,
+    maxArrive: reached.length ? Math.max(...reached.map((d) => d.arriveAt)) : 0,
+    totalWait: reached.reduce((s, d) => s + d.waitSeconds, 0),
+  };
+  return { metrics, details };
+}
+
+/**
+ * 为一次转场规划最优演员出场顺序。
+ * @param movers [{actor, startId, targetId, staticSeconds, staticPath:[zoneIds]}]
+ * @returns {
+ *   exact, method, evaluatedPlans, moverCount,
+ *   currentOrder:[actorName], bestOrder:[actorName], orderChanged,
+ *   current:{metrics,details}, best:{metrics,details}, note
+ * }
+ */
+function planTransitionOrder(zones, edges, blockedZoneIds, limit, movers, zoneNameFn) {
+  const n = movers.length;
+  const currentOrder = movers.map((_, i) => i);
+
+  // 当前（演员表）顺序：作为字典序比较的初始最优，也承担“稳定决胜”。
+  const currentRes = new Map();
+  const currentRun = simulateOrder(zones, edges, blockedZoneIds, currentRes, limit, movers, currentOrder, zoneNameFn);
+
+  let bestTuple = [currentRun.metrics.lateCount, currentRun.metrics.maxArrive, currentRun.metrics.totalWait];
+  let bestOrder = currentOrder.slice();
+  let evaluatedPlans = 1; // 当前顺序本身即第 1 个被评估方案
+
+  const exact = n <= EXACT_LIMIT;
+  let method;
+  let note;
+
+  if (exact) {
+    method = 'branch-and-bound';
+    note =
+      n === 0
+        ? '本转场没有需要重排的演员'
+        : `参与优化的 ${n} 位演员不超过 ${EXACT_LIMIT} 人，分支限界枚举全排列，结果为精确最优；指标相同的方案保留原演员表顺序。`;
+
+    // 分支限界 DFS：used 记录已出场演员，prefix 为已选下标；
+    // 前缀指标（超时人数/最晚到达/总等待）只随深度单调不减，故前缀字典序
+    // 一旦不劣于（>=）当前最优即可剪枝。
+    const used = new Array(n).fill(false);
+    const dfsRes = new Map();
+    const dfs = (depth, late, maxArrive, totalWait, prefix) => {
+      if (depth === n) {
+        evaluatedPlans++;
+        return;
+      }
+      for (let i = 0; i < n; i++) {
+        if (used[i]) continue;
+        const m = movers[i];
+        const sch = schedulePath(zones, edges, m.startId, m.targetId, blockedZoneIds, dfsRes);
+        const arriveAt = sch ? sch.arriveAt : 0;
+        const wait = sch ? sch.totalWaitSeconds : 0;
+        // 与 simulateOrder 的状态分类一致：静态最短即超时为 timeout，否则计入占用后超时为 congested
+        const lateI = sch && (m.staticSeconds > limit || arriveAt > limit) ? 1 : 0;
+        const tuple = [late + lateI, Math.max(maxArrive, arriveAt), totalWait + wait];
+        if (cmpTuple(tuple, bestTuple) >= 0) continue; // 前缀已不优于最优，剪枝
+        const pushed = sch ? reserveLegs(dfsRes, sch, m.actor) : [];
+        used[i] = true;
+        prefix.push(i);
+        if (depth + 1 === n) {
+          evaluatedPlans++;
+          bestTuple = tuple;
+          bestOrder = prefix.slice();
+        } else {
+          dfs(depth + 1, tuple[0], tuple[1], tuple[2], prefix);
+        }
+        prefix.pop();
+        used[i] = false;
+        rollbackReservations(dfsRes, pushed);
+      }
+    };
+    dfs(0, 0, 0, 0, []);
+  } else {
+    method = 'greedy';
+    note =
+      `参与优化的 ${n} 位演员超过 ${EXACT_LIMIT} 人，全排列为 ${n}! 将发生阶乘爆炸，` +
+      `改用确定性贪心：逐位选择使已出场前缀指标（超时人数、最晚到达、总等待）字典序最小的演员，并列时保留原演员表顺序中靠前者。` +
+      `本结果为近似方案（非精确最优）。`;
+
+    // 确定性贪心；模拟在预约表副本上进行，不污染后续评估。
+    const remaining = new Set(currentOrder);
+    const greedyRes = new Map();
+    let gLate = 0;
+    let gMax = 0;
+    let gWait = 0;
+    let greedyTuple = null;
+    const greedyOrder = [];
+    while (remaining.size) {
+      let pick = null;
+      let pickTuple = null;
+      for (const i of remaining) {
+        const m = movers[i];
+        const trialRes = cloneReservations(greedyRes);
+        const sch = schedulePath(zones, edges, m.startId, m.targetId, blockedZoneIds, trialRes);
+        const arriveAt = sch ? sch.arriveAt : 0;
+        const wait = sch ? sch.totalWaitSeconds : 0;
+        // 与 simulateOrder 的状态分类一致：静态最短即超时为 timeout，否则计入占用后超时为 congested
+        const lateI = sch && (m.staticSeconds > limit || arriveAt > limit) ? 1 : 0;
+        const tuple = [gLate + lateI, Math.max(gMax, arriveAt), gWait + wait];
+        // remaining 按原顺序迭代，严格更优才替换，天然稳定决胜
+        if (pickTuple === null || cmpTuple(tuple, pickTuple) < 0) {
+          pickTuple = tuple;
+          pick = i;
+        }
+      }
+      const m = movers[pick];
+      const sch = schedulePath(zones, edges, m.startId, m.targetId, blockedZoneIds, greedyRes);
+      if (sch) reserveLegs(greedyRes, sch, m.actor);
+      gLate = pickTuple[0];
+      gMax = pickTuple[1];
+      gWait = pickTuple[2];
+      greedyTuple = pickTuple;
+      greedyOrder.push(pick);
+      remaining.delete(pick);
+    }
+    evaluatedPlans += 1; // 贪心构造的方案计为 1 个评估方案
+    if (cmpTuple(greedyTuple || bestTuple, bestTuple) < 0) {
+      bestTuple = greedyTuple;
+      bestOrder = greedyOrder;
+    }
+  }
+
+  const orderChanged = bestOrder.some((v, i) => v !== i);
+  // 对最终建议顺序做一次完整模拟，得到逐人路线与等待明细。
+  const bestRes = new Map();
+  const bestRun = simulateOrder(zones, edges, blockedZoneIds, bestRes, limit, movers, bestOrder, zoneNameFn);
+
+  return {
+    exact,
+    method,
+    evaluatedPlans,
+    moverCount: n,
+    currentOrder: currentOrder.map((i) => movers[i].actor.name),
+    bestOrder: bestOrder.map((i) => movers[i].actor.name),
+    orderChanged,
+    current: { metrics: currentRun.metrics, details: currentRun.details },
+    best: { metrics: bestRun.metrics, details: bestRun.details },
+    note,
+  };
+}
+
+/** 复制预约表（贪心评估候选时使用，避免候选方案互相污染） */
+function cloneReservations(src) {
+  const dst = new Map();
+  for (const [edgeId, arr] of src) dst.set(edgeId, arr.map((iv) => ({ ...iv })));
+  return dst;
+}
+
 /**
  * 校验并规整文档。返回 { errors:[], warnings:[], doc }
  */
@@ -435,6 +688,8 @@ function analyze(input) {
       checkedActorTransitions: 0,
       failedActorTransitions: 0,
       congestedActorTransitions: 0,
+      orderOptimizedTransitions: 0, // 建议顺序相对演员表顺序有改动的转场数
+      approximateOrderTransitions: 0, // 演员超过 8 人、采用贪心近似的转场数
     },
     // 窄通道配置（供报告与导出展示）
     narrowEdges: doc.edges
@@ -488,6 +743,12 @@ function analyze(input) {
       }
     };
 
+    // 调度顺序优化的候选：需要移动（静态最短耗时 > 0）且静态可达的演员，
+    // 按演员表顺序收集（顺序即稳定决胜的基准）。
+    const movers = [];
+    // 不参与重排的演员计数与原因（供页面与导出说明）
+    const orderExcluded = { offstage: 0, unreachable: 0, stationary: 0 };
+
     for (const actor of doc.actors) {
       const prevP = prevScene.placements.find((p) => p.actorId === actor.id);
       const curP = scene.placements.find((p) => p.actorId === actor.id);
@@ -527,6 +788,7 @@ function analyze(input) {
             : startId == null
               ? '上一场结束位置在台下，默认从后台通道上场，不参与走位检查'
               : '本场起始位置在台下，默认经后台通道退场，不参与走位检查';
+        orderExcluded.offstage++;
         continue;
       }
 
@@ -560,6 +822,7 @@ function analyze(input) {
             result.reason = `不可穿越区域组合阻断了全部路线（无单一关键区域，需成组放开）。无阻断时最短耗时 ${result.baselineSeconds} 秒，路线：${result.baselinePathZoneNames.join(' → ')}`;
           }
         }
+        orderExcluded.unreachable++;
         continue;
       }
 
@@ -568,6 +831,19 @@ function analyze(input) {
       result.pathZoneIds = nodes;
       result.pathZoneNames = nodes.map(zoneName);
       result.pathEdgeIds = edgeIds;
+
+      // 静态可达：静态最短耗时 > 0（起止不同且确需移动）才参与出场顺序优化
+      if (dist.get(targetId) > 0) {
+        movers.push({
+          actor,
+          startId,
+          targetId,
+          staticSeconds: dist.get(targetId),
+          staticPath: nodes,
+        });
+      } else {
+        orderExcluded.stationary++;
+      }
 
       // 计入窄通道预约的最早到达调度（可在区域等待或绕路）
       const schedule = schedulePath(doc.zones, doc.edges, startId, targetId, blockedZoneIds, reservations);
@@ -642,6 +918,20 @@ function analyze(input) {
     const failed = transition.results.filter((r) => r.status === 'unreachable' || r.status === 'timeout' || r.status === 'congested');
     base.stats.failedActorTransitions += failed.length;
     if (failed.length) transition.failureReason = `${failed.length} 位演员无法按时完成转场：${failed.map((r) => `${r.actorName}（${statusLabel[r.status]}）`).join('、')}`;
+
+    // ---- 调度顺序优化（建议方案；不改变上方按演员表顺序得到的默认调度） ----
+    const exclusionParts = [];
+    if (orderExcluded.offstage) exclusionParts.push(`台下/后台 ${orderExcluded.offstage} 人`);
+    if (orderExcluded.unreachable) exclusionParts.push(`阻断不可达 ${orderExcluded.unreachable} 人`);
+    if (orderExcluded.stationary) exclusionParts.push(`起止同区无需移动 ${orderExcluded.stationary} 人`);
+    const excludedNote = exclusionParts.length ? `不参与顺序优化：${exclusionParts.join('、')}（出场先后对其无影响）。` : '';
+    const plan = planTransitionOrder(doc.zones, doc.edges, blockedZoneIds, limit, movers, zoneName);
+    if (excludedNote) plan.note = excludedNote + plan.note;
+    plan.excluded = orderExcluded;
+    transition.orderOptimization = plan;
+    if (plan.orderChanged) base.stats.orderOptimizedTransitions++;
+    if (!plan.exact) base.stats.approximateOrderTransitions++;
+
     base.transitions.push(transition);
   }
 
@@ -666,4 +956,14 @@ function analyze(input) {
   return base;
 }
 
-module.exports = { analyze, validateDocument, dijkstra, reconstructPath, connectedComponent, schedulePath, earliestFreeStart };
+module.exports = {
+  analyze,
+  validateDocument,
+  dijkstra,
+  reconstructPath,
+  connectedComponent,
+  schedulePath,
+  earliestFreeStart,
+  planTransitionOrder,
+  EXACT_LIMIT,
+};

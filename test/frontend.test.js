@@ -174,4 +174,144 @@ ok('Markdown 中拥堵原因与状态', () => {
   assert.ok(md2.includes('共等待 10s'));
 });
 
+console.log('== 调度顺序优化：页面渲染 ==');
+const reorderDoc = {
+  name: '顺序优化',
+  zones: [
+    { id: 'zA', name: '甲区', x: 0, y: 0 },
+    { id: 'zB', name: '乙区', x: 0, y: 0 },
+    { id: 'zC', name: '丙区', x: 0, y: 0 },
+    { id: 'zD', name: '丁区', x: 0, y: 0 },
+  ],
+  edges: [
+    { id: 'e1', a: 'zA', b: 'zB', seconds: 3 },
+    { id: 'e2', a: 'zB', b: 'zC', seconds: 8, narrow: true },
+    { id: 'e3', a: 'zC', b: 'zD', seconds: 2 },
+  ],
+  actors: [
+    { id: 'a1', name: '远途' },
+    { id: 'a2', name: '近途' },
+  ],
+  scenes: [
+    {
+      id: 's1',
+      name: '一',
+      durationFromPrev: null,
+      placements: [
+        { actorId: 'a1', from: null, to: 'zA' },
+        { actorId: 'a2', from: null, to: 'zB' },
+      ],
+    },
+    {
+      id: 's2',
+      name: '二',
+      durationFromPrev: 10,
+      placements: [
+        { actorId: 'a1', from: 'zD', to: null },
+        { actorId: 'a2', from: 'zC', to: null },
+      ],
+    },
+  ],
+  blocks: [],
+};
+const reorderReport = analyze(reorderDoc);
+vm.runInContext(`state.doc = ${JSON.stringify(reorderDoc)}; state.report = ${JSON.stringify(reorderReport)};`, ctx);
+vm.runInContext('renderReport();', ctx);
+const html3 = elements['#checkResult'].innerHTML;
+
+ok('展示优化面板标题与精确徽标', () => {
+  assert.ok(html3.includes('调度顺序优化'));
+  assert.ok(html3.includes('精确最优 · 分支限界'));
+});
+ok('并排展示当前顺序与建议顺序两套指标', () => {
+  assert.ok(html3.includes('当前（演员表）顺序'));
+  assert.ok(html3.includes('建议顺序'));
+  assert.ok(html3.includes('远途 → 近途'));
+  assert.ok(html3.includes('近途 → 远途'));
+  // 三套字典序指标
+  assert.ok(html3.includes('超时 <b>2</b> 人'));
+  assert.ok(html3.includes('超时 <b>1</b> 人'));
+  assert.ok(html3.includes('最晚到达 <b>19</b>s'));
+  assert.ok(html3.includes('总等待 <b>11</b>s'));
+});
+ok('建议顺序逐人路线可展开', () => {
+  assert.ok(html3.includes('建议顺序下的逐人路线与时刻（2 人）'));
+  assert.ok(html3.includes('乙区 → 丙区'));
+});
+ok('汇总栏包含顺序优化统计', () => {
+  assert.ok(html3.includes('建议调整顺序的转场<b>1</b>'));
+  assert.ok(html3.includes('贪心近似转场<b>0</b>'));
+});
+
+console.log('== 调度顺序优化：>8 人近似标注 ==');
+function makeManyActorsDoc(n) {
+  const actors = [];
+  for (let i = 0; i < n; i++) actors.push({ id: 'a' + (i + 1), name: '演员' + (i + 1) });
+  return {
+    name: '贪心渲染' + n,
+    zones: [
+      { id: 'zA', name: '甲区', x: 0, y: 0 },
+      { id: 'zB', name: '乙区', x: 0, y: 0 },
+      { id: 'zC', name: '丙区', x: 0, y: 0 },
+      { id: 'zD', name: '丁区', x: 0, y: 0 },
+    ],
+    edges: [
+      { id: 'e1', a: 'zA', b: 'zB', seconds: 3 },
+      { id: 'e2', a: 'zB', b: 'zC', seconds: 8, narrow: true },
+      { id: 'e3', a: 'zC', b: 'zD', seconds: 2 },
+    ],
+    actors,
+    scenes: [
+      { id: 's1', name: '一', durationFromPrev: null, placements: actors.map((a, idx) => ({ actorId: a.id, from: null, to: idx % 2 ? 'zB' : 'zA' })) },
+      { id: 's2', name: '二', durationFromPrev: 10, placements: actors.map((a, idx) => ({ actorId: a.id, from: idx % 2 ? 'zC' : 'zD', to: null })) },
+    ],
+    blocks: [],
+  };
+}
+const nineReport = analyze(makeManyActorsDoc(9));
+vm.runInContext(`state.doc = ${JSON.stringify(makeManyActorsDoc(9))}; state.report = ${JSON.stringify(nineReport)};`, ctx);
+vm.runInContext('renderReport();', ctx);
+const html4 = elements['#checkResult'].innerHTML;
+ok('9 人时页面明确标注近似', () => {
+  assert.ok(html4.includes('近似方案 · 确定性贪心'));
+  assert.ok(html4.includes('贪心近似转场<b>1</b>'));
+});
+
+console.log('== 调度顺序优化：导出同步包含建议方案与是否精确 ==');
+downloads.length = 0;
+vm.runInContext('exportJson();', ctx);
+ok('JSON 导出包含 orderOptimization 与 exact 字段', () => {
+  const exported = JSON.parse(downloads[0].content);
+  const oo = exported.transitions[0].orderOptimization;
+  assert.strictEqual(oo.exact, false);
+  assert.strictEqual(oo.method, 'greedy');
+  assert.ok(Array.isArray(oo.bestOrder));
+  assert.strictEqual(oo.moverCount, 9);
+  assert.ok(oo.current.metrics && oo.best.metrics);
+});
+
+downloads.length = 0;
+vm.runInContext('exportMarkdown();', ctx);
+const md3 = downloads[0].content;
+ok('Markdown 导出包含建议顺序与是否精确', () => {
+  assert.ok(md3.includes('调度顺序优化建议'));
+  assert.ok(md3.includes('是否精确：**否（确定性贪心，近似结果）**'));
+  assert.ok(md3.includes('当前（演员表）顺序：'));
+  assert.ok(md3.includes('建议顺序：'));
+  assert.ok(md3.includes('建议顺序逐人路线：'));
+});
+
+// 精确场景的 Markdown 标注
+const mdReorderReport = analyze(reorderDoc);
+vm.runInContext(`state.doc = ${JSON.stringify(reorderDoc)}; state.report = ${JSON.stringify(mdReorderReport)};`, ctx);
+downloads.length = 0;
+vm.runInContext('exportMarkdown();', ctx);
+const md4 = downloads[0].content;
+ok('精确场景 Markdown 标注为精确并列出两套指标', () => {
+  assert.ok(md4.includes('是否精确：**是（分支限界全排列）**'));
+  assert.ok(md4.includes('超时 2 人 / 最晚到达 19 秒 / 总等待 11 秒'));
+  assert.ok(md4.includes('超时 1 人 / 最晚到达 18 秒 / 总等待 5 秒'));
+  assert.ok(md4.includes('近途 → 远途'));
+});
+
 console.log(`\n全部通过：${passed} 项`);

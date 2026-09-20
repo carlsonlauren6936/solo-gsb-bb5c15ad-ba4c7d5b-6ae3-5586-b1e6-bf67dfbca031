@@ -661,9 +661,9 @@ function scheduledRouteNames(a) {
   return a.pathZoneNames;
 }
 
-/** 逐人行程明细：进入/离开时间与等待段 */
-function scheduleDetailHtml(a) {
-  const sch = a.schedule;
+/** 逐人行程明细：进入/离开时间与等待段（接受 {schedule} 结构，默认取检查结果上的 schedule） */
+function scheduleDetailHtml(a, schInput) {
+  const sch = schInput || a.schedule;
   if (!sch || !sch.legs.length) return '';
   const items = [`<li>0s 自「${esc(sch.legs[0].fromZoneName)}」出发</li>`];
   for (const leg of sch.legs) {
@@ -684,6 +684,76 @@ function scheduleDetailHtml(a) {
       <summary>行程明细：0s 出发 → ${sch.arriveAt}s 到达${sch.totalWaitSeconds ? `（含等待 ${sch.totalWaitSeconds}s）` : ''}</summary>
       <ul>${items.join('')}</ul>
     </details>`;
+}
+
+/**
+ * 调度顺序优化面板：展示当前（演员表）顺序与建议顺序的两套指标、建议顺序名单与逐人路线。
+ * 建议方案是旁路计算，不改变上方的默认调度结果。
+ */
+function orderOptimizationHtml(o, limitSeconds) {
+  if (!o) return '';
+  const m = (x) => `超时 <b>${x.lateCount}</b> 人 · 最晚到达 <b>${x.maxArrive}</b>s · 总等待 <b>${x.totalWait}</b>s`;
+  const curNames = o.currentOrder.map(esc).join(' → ');
+  const bestNames = o.bestOrder.map(esc).join(' → ');
+  const badge = o.exact
+    ? '<span class="opt-tag exact">精确最优 · 分支限界</span>'
+    : '<span class="opt-tag approx">近似方案 · 确定性贪心</span>';
+  const head = o.orderChanged
+    ? `<span class="opt-head changed">💡 建议调整出场顺序（指标字典序更优）</span>`
+    : `<span class="opt-head same">建议顺序与演员表顺序一致（已是字典序最优；指标相同不改动顺序）</span>`;
+
+  const rows = o.best.details
+    .map((d) => {
+      const route = d.pathZoneNames.map(esc).join(' → ');
+      const cls = d.status === 'ok' ? 'ok' : d.status === 'offstage' ? 'offstage' : 'bad';
+      const late = d.status === 'timeout' || d.status === 'congested';
+      return `
+        <div class="opt-actor">
+          <div class="ar-line1">
+            <span class="ar-actor">${esc(d.actorName)}</span>
+            <span class="ar-path">${route}</span>
+            <span class="ar-time ${cls}">${d.arriveAt}s / ${limitSeconds}s${d.waitSeconds ? `（等待 ${d.waitSeconds}s）` : ''} · ${late ? '超时' : '按时'}</span>
+          </div>
+          ${scheduleDetailHtml(null, d.schedule)}
+        </div>`;
+    })
+    .join('');
+
+  const excl = [];
+  if (o.excluded) {
+    if (o.excluded.offstage) excl.push(`台下/后台 ${o.excluded.offstage} 人`);
+    if (o.excluded.unreachable) excl.push(`阻断不可达 ${o.excluded.unreachable} 人`);
+    if (o.excluded.stationary) excl.push(`起止同区 ${o.excluded.stationary} 人`);
+  }
+
+  return `
+  <div class="order-opt ${o.orderChanged ? 'changed' : 'same'} ${o.exact ? '' : 'approx'}">
+    <div class="opt-title">
+      🎚️ 调度顺序优化
+      ${badge}
+      <span class="opt-meta">参与 ${o.moverCount} 人 · 枚举/评估 ${o.evaluatedPlans} 个顺序方案</span>
+    </div>
+    ${head}
+    <div class="opt-metrics">
+      <div class="opt-metric cur">
+        <div class="opt-metric-label">当前（演员表）顺序</div>
+        <div class="opt-order-line">${curNames}</div>
+        <div>${m(o.current.metrics)}</div>
+      </div>
+      <div class="opt-arrow">➡️</div>
+      <div class="opt-metric best">
+        <div class="opt-metric-label">建议顺序</div>
+        <div class="opt-order-line">${bestNames}</div>
+        <div>${m(o.best.metrics)}</div>
+      </div>
+    </div>
+    <details class="opt-routes">
+      <summary>建议顺序下的逐人路线与时刻（${o.best.details.length} 人）</summary>
+      ${rows}
+    </details>
+    ${excl.length ? `<p class="opt-note">不参与优化：${excl.join('、')}（出场先后对其无影响）。</p>` : ''}
+    <p class="opt-note">${esc(o.note)}</p>
+  </div>`;
 }
 
 function renderReport() {
@@ -709,6 +779,8 @@ function renderReport() {
       <span class="summary-item">演员转场检查<b>${r.stats.checkedActorTransitions}</b></span>
       <span class="summary-item">失败转场人次<b>${r.stats.failedActorTransitions}</b></span>
       <span class="summary-item">其中窄通道拥堵<b>${r.stats.congestedActorTransitions}</b></span>
+      <span class="summary-item">建议调整顺序的转场<b>${r.stats.orderOptimizedTransitions}</b></span>
+      <span class="summary-item">贪心近似转场<b>${r.stats.approximateOrderTransitions}</b></span>
     </div>`;
 
     if (r.firstImpossible) {
@@ -790,6 +862,7 @@ function renderReport() {
           ${scheduleDetailHtml(a)}
         </div>`;
       }
+      html += orderOptimizationHtml(t.orderOptimization, t.limitSeconds);
       html += '</div>';
     }
   }
@@ -924,6 +997,37 @@ function exportMarkdown() {
             `${a.waitSeconds ? `，共等待 ${a.waitSeconds}s` : ''}`,
         );
       }
+      L.push('');
+    }
+
+    // 调度顺序优化建议（不改变上方按演员表顺序的默认调度）
+    const o = t.orderOptimization;
+    if (o) {
+      const mm = (x) => `超时 ${x.lateCount} 人 / 最晚到达 ${x.maxArrive} 秒 / 总等待 ${x.totalWait} 秒`;
+      L.push(`#### 🎚️ 调度顺序优化建议（${o.exact ? '精确最优 · 分支限界' : '近似方案 · 确定性贪心'}）`);
+      L.push('');
+      L.push(`- 当前（演员表）顺序：${o.currentOrder.join(' → ')}`);
+      L.push(`  - 指标：${mm(o.current.metrics)}`);
+      L.push(`- 建议顺序：${o.bestOrder.join(' → ')}${o.orderChanged ? '' : '（与当前一致，无需调整）'}`);
+      L.push(`  - 指标：${mm(o.best.metrics)}`);
+      L.push(`- 是否精确：**${o.exact ? '是（分支限界全排列）' : '否（确定性贪心，近似结果）'}**；参与优化 ${o.moverCount} 人，共评估 ${o.evaluatedPlans} 个顺序方案`);
+      if (o.excluded && (o.excluded.offstage || o.excluded.unreachable || o.excluded.stationary)) {
+        const ex = [];
+        if (o.excluded.offstage) ex.push(`台下/后台 ${o.excluded.offstage} 人`);
+        if (o.excluded.unreachable) ex.push(`阻断不可达 ${o.excluded.unreachable} 人`);
+        if (o.excluded.stationary) ex.push(`起止同区 ${o.excluded.stationary} 人`);
+        L.push(`- 不参与优化：${ex.join('、')}（出场先后对其无影响）`);
+      }
+      L.push('- 建议顺序逐人路线：');
+      for (const d of o.best.details) {
+        const late = d.status === 'timeout' || d.status === 'congested';
+        L.push(
+          `  - ${d.actorName}（${late ? '超时' : '按时'}）：${d.pathZoneNames.join(' → ')}，` +
+            `到达 ${d.arriveAt} 秒 / 限 ${t.limitSeconds} 秒${d.waitSeconds ? `，等待 ${d.waitSeconds} 秒` : ''}`,
+        );
+      }
+      L.push('');
+      L.push(`> ${o.note}`);
       L.push('');
     }
   }
