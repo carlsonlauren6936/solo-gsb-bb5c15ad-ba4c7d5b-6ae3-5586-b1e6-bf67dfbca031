@@ -686,6 +686,58 @@ function scheduleDetailHtml(a) {
     </details>`;
 }
 
+/** 调度顺序优化小节：当前 vs 建议两套指标、建议顺序与逐人路线 */
+function optimizationHtml(t) {
+  const o = t.optimization;
+  if (!o) return '';
+  const fmt = (m) => `超时 ${m.lateCount} 人 · 最晚到达 ${m.maxArriveAt}s · 总等待 ${m.totalWaitSeconds}s`;
+  const algoTag = o.exact ? '精确 · 分支限界' : '近似 · 确定性贪心';
+
+  let inner = '';
+  if (o.improved) {
+    inner += `<div class="opt-verdict improved">✨ 建议调整调度顺序：${fmt(o.suggested)}，优于当前顺序（${fmt(o.current)}）</div>`;
+  } else {
+    inner += `<div class="opt-verdict">当前演员表顺序即为所选方案（${
+      o.exact ? '已证明不劣于任何顺序' : '贪心未找到更优顺序'
+    }，指标并列时以原演员顺序决胜）：${fmt(o.current)}</div>`;
+  }
+  inner += `<div class="opt-order">建议顺序：${o.suggested.orderActorNames.map(esc).join(' → ')}</div>`;
+
+  const rows = o.suggested.results
+    .map((a) => {
+      const route = scheduledRouteNames(a).map(esc).join(' → ');
+      const time =
+        `${a.arriveAt}s / ${t.limitSeconds}s` +
+        (a.waitSeconds ? `（含等待 ${a.waitSeconds}s）` : '') +
+        (a.late ? ' · 超时' : '');
+      return `
+      <div class="actor-result opt-actor">
+        <div class="ar-line1">
+          <span class="ar-actor">${esc(a.actorName)}</span>
+          <span class="ar-path">${route}</span>
+          <span class="ar-time ${a.late ? 'congested' : 'ok'}">${time}</span>
+        </div>
+        ${scheduleDetailHtml(a)}
+      </div>`;
+    })
+    .join('');
+  inner += `
+    <details class="opt-detail">
+      <summary>建议方案逐人路线（${o.actorCount} 人，按建议顺序规划）</summary>
+      ${rows}
+    </details>`;
+
+  return `
+    <div class="opt-block">
+      <div class="opt-head">
+        🔀 调度顺序优化
+        <span class="opt-tag ${o.exact ? 'exact' : 'approx'}">${algoTag}</span>
+        <span class="meta">参与 ${o.actorCount} 人（需移动且静态可达；台下与不可达者不参与）</span>
+      </div>
+      ${inner}
+    </div>`;
+}
+
 function renderReport() {
   const r = state.report;
   const box = $('#checkResult');
@@ -790,6 +842,7 @@ function renderReport() {
           ${scheduleDetailHtml(a)}
         </div>`;
       }
+      html += optimizationHtml(t);
       html += '</div>';
     }
   }
@@ -922,6 +975,31 @@ function exportMarkdown() {
         L.push(
           `- ${a.actorName}：${parts.join('；')}。到达 ${a.schedule.arriveAt}s / 限 ${t.limitSeconds}s` +
             `${a.waitSeconds ? `，共等待 ${a.waitSeconds}s` : ''}`,
+        );
+      }
+      L.push('');
+    }
+
+    if (t.optimization) {
+      const o = t.optimization;
+      const algo = o.exact ? '精确 · 分支限界' : '近似 · 确定性贪心（参与人数超过 8，结果可能非全局最优）';
+      const fmt = (m) => `超时 ${m.lateCount} 人 · 最晚到达 ${m.maxArriveAt}s · 总等待 ${m.totalWaitSeconds}s`;
+      L.push(`#### 调度顺序优化（${algo}，参与 ${o.actorCount} 人）`);
+      L.push('');
+      L.push(`- 当前顺序（演员表）：${o.current.orderActorNames.join(' → ')} —— ${fmt(o.current)}`);
+      L.push(
+        `- 建议顺序：${o.suggested.orderActorNames.join(' → ')} —— ${fmt(o.suggested)}` +
+          (o.improved ? '　**优于当前顺序**' : '（不劣于任何已评估顺序，指标并列时以原演员顺序决胜）'),
+      );
+      L.push('');
+      L.push('建议方案逐人路线（按建议顺序规划，时刻自换场开始计）：');
+      L.push('');
+      L.push('| 演员 | 到达 / 时限 | 等待 | 路线 |');
+      L.push('| --- | --- | --- | --- |');
+      for (const a of o.suggested.results) {
+        const route = scheduledRouteNames(a).join(' → ');
+        L.push(
+          `| ${a.actorName} | ${a.arriveAt} 秒 / ${t.limitSeconds} 秒 | ${a.waitSeconds ? `${a.waitSeconds} 秒` : '—'} | ${route.replace(/\|/g, '\\|')} |`,
         );
       }
       L.push('');
